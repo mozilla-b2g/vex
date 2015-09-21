@@ -97,7 +97,7 @@ VEX_REGPARM(1)
 static ULong genericg_compute_checksum_8al_12 ( HWord first_w64 );
 
 /* Small helpers */
-static Bool const_False ( void* callback_opaque, Addr64 a ) { 
+static Bool const_False ( void* callback_opaque, Addr a ) { 
    return False; 
 }
 
@@ -131,8 +131,8 @@ static Bool const_False ( void* callback_opaque, Addr64 a ) {
    not to disassemble any instructions into it; this is indicated
    by the callback returning True.
 
-   offB_TIADDR and offB_TILEN are the offsets of guest_TIADDR and
-   guest_TILEN.  Since this routine has to work for any guest state,
+   offB_CMADDR and offB_CMLEN are the offsets of guest_CMADDR and
+   guest_CMLEN.  Since this routine has to work for any guest state,
    without knowing what it is, those offsets have to passed in.
 
    callback_opaque is a caller-supplied pointer to data which the
@@ -181,21 +181,24 @@ IRSB* bb_to_IR (
          /*OUT*/VexGuestExtents* vge,
          /*OUT*/UInt*            n_sc_extents,
          /*OUT*/UInt*            n_guest_instrs, /* stats only */
+         /*MOD*/VexRegisterUpdates* pxControl,
          /*IN*/ void*            callback_opaque,
          /*IN*/ DisOneInstrFn    dis_instr_fn,
-         /*IN*/ UChar*           guest_code,
-         /*IN*/ Addr64           guest_IP_bbstart,
-         /*IN*/ Bool             (*chase_into_ok)(void*,Addr64),
-         /*IN*/ Bool             host_bigendian,
+         /*IN*/ const UChar*     guest_code,
+         /*IN*/ Addr             guest_IP_bbstart,
+         /*IN*/ Bool             (*chase_into_ok)(void*,Addr),
+         /*IN*/ VexEndness       host_endness,
          /*IN*/ Bool             sigill_diag,
          /*IN*/ VexArch          arch_guest,
-         /*IN*/ VexArchInfo*     archinfo_guest,
-         /*IN*/ VexAbiInfo*      abiinfo_both,
+         /*IN*/ const VexArchInfo* archinfo_guest,
+         /*IN*/ const VexAbiInfo*  abiinfo_both,
          /*IN*/ IRType           guest_word_type,
-         /*IN*/ UInt             (*needs_self_check)(void*,VexGuestExtents*),
+         /*IN*/ UInt             (*needs_self_check)
+                                    (void*, /*MB_MOD*/VexRegisterUpdates*,
+                                            const VexGuestExtents*),
          /*IN*/ Bool             (*preamble_function)(void*,IRSB*),
-         /*IN*/ Int              offB_GUEST_TISTART,
-         /*IN*/ Int              offB_GUEST_TILEN,
+         /*IN*/ Int              offB_GUEST_CMSTART,
+         /*IN*/ Int              offB_GUEST_CMLEN,
          /*IN*/ Int              offB_GUEST_IP,
          /*IN*/ Int              szB_GUEST_IP
       )
@@ -210,18 +213,18 @@ IRSB* bb_to_IR (
    Int        d_resteers = 0;
    Int        selfcheck_idx = 0;
    IRSB*      irsb;
-   Addr64     guest_IP_curr_instr;
+   Addr       guest_IP_curr_instr;
    IRConst*   guest_IP_bbstart_IRConst = NULL;
    Int        n_cond_resteers_allowed = 2;
 
-   Bool (*resteerOKfn)(void*,Addr64) = NULL;
+   Bool (*resteerOKfn)(void*,Addr) = NULL;
 
    debug_print = toBool(vex_traceflags & VEX_TRACE_FE);
 
    /* check sanity .. */
    vassert(sizeof(HWord) == sizeof(void*));
    vassert(vex_control.guest_max_insns >= 1);
-   vassert(vex_control.guest_max_insns < 100);
+   vassert(vex_control.guest_max_insns <= 100);
    vassert(vex_control.guest_chase_thresh >= 0);
    vassert(vex_control.guest_chase_thresh < vex_control.guest_max_insns);
    vassert(guest_word_type == Ity_I32 || guest_word_type == Ity_I64);
@@ -329,10 +332,10 @@ IRSB* bb_to_IR (
          was originally Thumb or ARM.  For more details of this
          convention, see comments on definition of guest_R15T in
          libvex_guest_arm.h. */
-      if (arch_guest == VexArchARM && (guest_IP_curr_instr & (Addr64)1)) {
+      if (arch_guest == VexArchARM && (guest_IP_curr_instr & 1)) {
          /* Thumb insn => mask out the T bit, but put it in delta */
          addStmtToIRSB( irsb,
-                        IRStmt_IMark(guest_IP_curr_instr & ~(Addr64)1,
+                        IRStmt_IMark(guest_IP_curr_instr & ~(Addr)1,
                                      0, /* len */
                                      1  /* delta */
                         )
@@ -362,7 +365,7 @@ IRSB* bb_to_IR (
                             arch_guest,
                             archinfo_guest,
                             abiinfo_both,
-                            host_bigendian,
+                            host_endness,
                             sigill_diag );
 
       /* stay sane ... */
@@ -371,7 +374,7 @@ IRSB* bb_to_IR (
               || dres.whatNext == Dis_ResteerU
               || dres.whatNext == Dis_ResteerC);
       /* ... disassembled insn length is sane ... */
-      vassert(dres.len >= 0 && dres.len <= 20);
+      vassert(dres.len >= 0 && dres.len <= 24);
       /* ... continueAt is zero if no resteer requested ... */
       if (dres.whatNext != Dis_ResteerU && dres.whatNext != Dis_ResteerC)
          vassert(dres.continueAt == 0);
@@ -386,7 +389,7 @@ IRSB* bb_to_IR (
       vassert(imark);
       vassert(imark->tag == Ist_IMark);
       vassert(imark->Ist.IMark.len == 0);
-      imark->Ist.IMark.len = toUInt(dres.len);
+      imark->Ist.IMark.len = dres.len;
 
       /* Print the resulting IR, if needed. */
       if (vex_traceflags & VEX_TRACE_FE) {
@@ -471,7 +474,7 @@ IRSB* bb_to_IR (
             n_resteers++;
             d_resteers++;
             if (0 && (n_resteers & 0xFF) == 0)
-            vex_printf("resteer[%d,%d] to 0x%llx (delta = %lld)\n",
+            vex_printf("resteer[%d,%d] to 0x%lx (delta = %lld)\n",
                        n_resteers, d_resteers,
                        dres.continueAt, delta);
             break;
@@ -514,7 +517,7 @@ IRSB* bb_to_IR (
       that do.
    */
    {
-      Addr64   base2check;
+      Addr     base2check;
       UInt     len2check;
       HWord    expectedhW;
       IRTemp   tistart_tmp, tilen_tmp;
@@ -527,9 +530,8 @@ IRSB* bb_to_IR (
       UInt     host_word_szB = sizeof(HWord);
       IRType   host_word_type = Ity_INVALID;
 
-      VexGuestExtents vge_tmp = *vge;
       UInt extents_needing_check
-         = needs_self_check(callback_opaque, &vge_tmp);
+         = needs_self_check(callback_opaque, pxControl, vge);
 
       if (host_word_szB == 4) host_word_type = Ity_I32;
       if (host_word_szB == 8) host_word_type = Ity_I64;
@@ -663,7 +665,7 @@ IRSB* bb_to_IR (
             vassert(!nm_spec);
          }
 
-         /* Set TISTART and TILEN.  These will describe to the despatcher
+         /* Set CMSTART and CMLEN.  These will describe to the despatcher
             the area of guest code to invalidate should we exit with a
             self-check failure. */
 
@@ -684,10 +686,10 @@ IRSB* bb_to_IR (
             = IRStmt_WrTmp(tilen_tmp, IRExpr_Const(len2check_IRConst) );
 
          irsb->stmts[selfcheck_idx + i * 5 + 2]
-            = IRStmt_Put( offB_GUEST_TISTART, IRExpr_RdTmp(tistart_tmp) );
+            = IRStmt_Put( offB_GUEST_CMSTART, IRExpr_RdTmp(tistart_tmp) );
 
          irsb->stmts[selfcheck_idx + i * 5 + 3]
-            = IRStmt_Put( offB_GUEST_TILEN, IRExpr_RdTmp(tilen_tmp) );
+            = IRStmt_Put( offB_GUEST_CMLEN, IRExpr_RdTmp(tilen_tmp) );
 
          /* Generate the entry point descriptors */
          if (abiinfo_both->host_ppc_calls_use_fndescrs) {
@@ -737,7 +739,7 @@ IRSB* bb_to_IR (
                           ? IRExpr_Const(IRConst_U64(expectedhW))
                           : IRExpr_Const(IRConst_U32(expectedhW))
                  ),
-                 Ijk_TInval,
+                 Ijk_InvalICache,
                  /* Where we must restart if there's a failure: at the
                     first extent, regardless of which extent the
                     failure actually happened in. */

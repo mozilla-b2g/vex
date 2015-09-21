@@ -210,8 +210,8 @@ typedef
       /* 1196 */ UInt guest_EMNOTE;
 
       /* For icbi: record start and length of area to invalidate */
-      /* 1200 */ UInt guest_TISTART;
-      /* 1204 */ UInt guest_TILEN;
+      /* 1200 */ UInt guest_CMSTART;
+      /* 1204 */ UInt guest_CMLEN;
 
       /* Used to record the unredirected guest address at the start of
          a translation whose start has been redirected.  By reading
@@ -229,7 +229,7 @@ typedef
       /* 1216 */ UInt guest_REDIR_SP;
       /* 1220 */ UInt guest_REDIR_STACK[VEX_GUEST_PPC32_REDIR_STACK_SIZE];
 
-      /* Needed for AIX (but mandated for all guest architectures):
+      /* Needed for Darwin (but mandated for all guest architectures):
          CIA at the last SC insn.  Used when backing up to restart a
          syscall that has been interrupted by a signal. */
       /* 1348 */ UInt guest_IP_AT_SYSCALL;
@@ -241,9 +241,10 @@ typedef
       /* 1360 */ ULong guest_TFHAR;     // Transaction Failure Handler Address Register 
       /* 1368 */ ULong guest_TEXASR;    // Transaction EXception And Summary Register
       /* 1376 */ ULong guest_TFIAR;     // Transaction Failure Instruction Address Register
+      /* 1384 */ UInt  guest_TEXASRU;   // Transaction EXception And Summary Register Upper
 
       /* Padding to make it have an 16-aligned size */
-      /* 1384 */ UInt  padding2;
+      /* 1388 */ UInt  padding2;
 
    }
    VexGuestPPC32State;

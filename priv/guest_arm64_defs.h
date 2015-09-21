@@ -41,16 +41,16 @@
    bb_to_IR.h. */
 extern
 DisResult disInstr_ARM64 ( IRSB*        irbb,
-                           Bool         (*resteerOkFn) ( void*, Addr64 ),
+                           Bool         (*resteerOkFn) ( void*, Addr ),
                            Bool         resteerCisOk,
                            void*        callback_opaque,
-                           UChar*       guest_code,
+                           const UChar* guest_code,
                            Long         delta,
-                           Addr64       guest_IP,
+                           Addr         guest_IP,
                            VexArch      guest_arch,
-                           VexArchInfo* archinfo,
-                           VexAbiInfo*  abiinfo,
-                           Bool         host_bigendian,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo*  abiinfo,
+                           VexEndness   host_endness,
                            Bool         sigill_diag );
 
 /* Used by the optimiser to specialise calls to helpers. */
@@ -64,7 +64,8 @@ IRExpr* guest_arm64_spechelper ( const HChar* function_name,
    precise memory exceptions.  This is logically part of the guest
    state description. */
 extern 
-Bool guest_arm64_state_requires_precise_mem_exns ( Int, Int );
+Bool guest_arm64_state_requires_precise_mem_exns ( Int, Int,
+                                                   VexRegisterUpdates );
 
 extern
 VexGuestLayout arm64Guest_layout;
@@ -83,12 +84,12 @@ extern
 ULong arm64g_calculate_flags_nzcv ( ULong cc_op, ULong cc_dep1,
                                     ULong cc_dep2, ULong cc_dep3 );
 
-//ZZ /* Calculate the C flag from the thunk components, in the lowest bit
-//ZZ    of the word (bit 0). */
-//ZZ extern 
-//ZZ UInt armg_calculate_flag_c ( UInt cc_op, UInt cc_dep1,
-//ZZ                              UInt cc_dep2, UInt cc_dep3 );
-//ZZ 
+/* Calculate the C flag from the thunk components, in the lowest bit
+   of the word (bit 0). */
+extern
+ULong arm64g_calculate_flag_c ( ULong cc_op, ULong cc_dep1,
+                                ULong cc_dep2, ULong cc_dep3 );
+
 //ZZ /* Calculate the V flag from the thunk components, in the lowest bit
 //ZZ    of the word (bit 0). */
 //ZZ extern 
@@ -108,6 +109,11 @@ ULong arm64g_calculate_condition ( /* ARM64Condcode << 4 | cc_op */
 //ZZ extern 
 //ZZ UInt armg_calculate_flag_qc ( UInt resL1, UInt resL2,
 //ZZ                               UInt resR1, UInt resR2 );
+
+
+/* --- DIRTY HELPERS --- */
+
+extern ULong arm64g_dirtyhelper_MRS_CNTVCT_EL0 ( void );
 
 
 /*---------------------------------------------------------*/
@@ -159,8 +165,10 @@ ULong arm64g_calculate_condition ( /* ARM64Condcode << 4 | cc_op */
    OP_ADD64          argL              argR              unused
    OP_SUB32          argL              argR              unused
    OP_SUB64          argL              argR              unused
-//ZZ    OP_ADC            argL              argR              31x0:old_C
-//ZZ    OP_SBB            argL              argR              31x0:old_C
+   OP_ADC32          argL              argR              63x0:old_C
+   OP_ADC64          argL              argR              63x0:old_C
+   OP_SBC32          argL              argR              63x0:old_C
+   OP_SBC64          argL              argR              63x0:old_C
    OP_LOGIC32        result            unused            unused
    OP_LOGIC64        result            unused            unused
 //ZZ    OP_MUL            result            unused            30x0:old_C:old_V
@@ -183,11 +191,17 @@ enum {
    ARM64G_CC_OP_SUB64,    /* DEP1 = argL (Rn), DEP2 = argR (shifter_op),
                              DEP3 = 0 */
 
-//ZZ    ARMG_CC_OP_ADC,     /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op),
-//ZZ                           DEP3 = oldC (in LSB) */
-//ZZ 
-//ZZ    ARMG_CC_OP_SBB,     /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op),
-//ZZ                           DEP3 = oldC (in LSB) */
+   ARM64G_CC_OP_ADC32,    /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op),
+                             DEP3 = oldC (in LSB) */
+
+   ARM64G_CC_OP_ADC64,    /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op),
+                             DEP3 = oldC (in LSB) */
+
+   ARM64G_CC_OP_SBC32,    /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op),
+                             DEP3 = oldC (in LSB) */
+
+   ARM64G_CC_OP_SBC64,    /* DEP1 = argL (Rn), DEP2 = arg2 (shifter_op),
+                             DEP3 = oldC (in LSB) */
 
    ARM64G_CC_OP_LOGIC32,  /* DEP1 = result, DEP2 = 0, DEP3 = 0 */
    ARM64G_CC_OP_LOGIC64,  /* DEP1 = result, DEP2 = 0, DEP3 = 0 */

@@ -90,10 +90,11 @@ typedef
          all the old x87 FPU gunk
          segment registers */
 
-      /* HACK to make tls on amd64-linux work.  %fs only ever seems to
-         hold zero, and so guest_FS_ZERO holds the 64-bit offset
-         associated with a %fs value of zero. */
-      /* 200 */ ULong guest_FS_ZERO;
+      /* HACK to e.g. make tls on amd64-linux work.  %fs only ever seems to
+         hold a constant value (zero on linux main thread, 0x63 in other
+         threads), and so guest_FS_CONST holds
+         the 64-bit offset associated with this constant %fs value. */
+      /* 200 */ ULong guest_FS_CONST;
 
       /* YMM registers.  Note that these must be allocated
          consecutively in order that the SSE4.2 PCMP{E,I}STR{I,M}
@@ -123,6 +124,7 @@ typedef
          delicately-balanced PutI/GetI optimisation machinery.
          Therefore best to leave it as a UInt. */
       UInt  guest_FTOP;
+      UInt  pad1;
       ULong guest_FPREG[8];
       UChar guest_FPTAG[8];
       ULong guest_FPROUND;
@@ -130,6 +132,7 @@ typedef
 
       /* Emulation notes */
       UInt  guest_EMNOTE;
+      UInt  pad2;
 
       /* Translation-invalidation area description.  Not used on amd64
          (there is no invalidate-icache insn), but needed so as to
@@ -138,8 +141,8 @@ typedef
          compilation breakage.  On amd64, these two fields are set to
          zero by LibVEX_GuestAMD64_initialise and then should be
          ignored forever thereafter. */
-      ULong guest_TISTART;
-      ULong guest_TILEN;
+      ULong guest_CMSTART;
+      ULong guest_CMLEN;
 
       /* Used to record the unredirected guest address at the start of
          a translation whose start has been redirected.  By reading
@@ -152,11 +155,12 @@ typedef
       /* Used for Darwin syscall dispatching. */
       ULong guest_SC_CLASS;
 
-      /* HACK to make tls on darwin work.  %gs only ever seems to
-         hold 0x60, and so guest_GS_0x60 holds the 64-bit offset
-         associated with a %gs value of 0x60.  (A direct analogue
-         of the %fs-zero hack for amd64-linux). */
-      ULong guest_GS_0x60;
+      /* HACK to make e.g. tls on darwin work, wine on linux work, ...
+         %gs only ever seems to hold a constant value (e.g. 0x60 on darwin,
+         0x6b on linux), and so guest_GS_CONST holds the 64-bit offset
+         associated with this constant %gs value.  (A direct analogue
+         of the %fs-const hack for amd64-linux). */
+      ULong guest_GS_CONST;
 
       /* Needed for Darwin (but mandated for all guest architectures):
          RIP at the last syscall insn (int 0x80/81/82, sysenter,
@@ -165,7 +169,7 @@ typedef
       ULong guest_IP_AT_SYSCALL;
 
       /* Padding to make it have an 16-aligned size */
-      ULong pad1;
+      ULong pad3;
    }
    VexGuestAMD64State;
 

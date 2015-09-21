@@ -252,8 +252,8 @@ typedef
       /* 1340 */ UInt  padding;
 
       /* For icbi: record start and length of area to invalidate */
-      /* 1344 */ ULong guest_TISTART;
-      /* 1352 */ ULong guest_TILEN;
+      /* 1344 */ ULong guest_CMSTART;
+      /* 1352 */ ULong guest_CMLEN;
 
       /* Used to record the unredirected guest address at the start of
          a translation whose start has been redirected.  By reading
@@ -271,7 +271,7 @@ typedef
       /* 1376 */ ULong guest_REDIR_SP;
       /* 1384 */ ULong guest_REDIR_STACK[VEX_GUEST_PPC64_REDIR_STACK_SIZE];
 
-      /* Needed for AIX: CIA at the last SC insn.  Used when backing up
+      /* Needed for Darwin: CIA at the last SC insn.  Used when backing up
          to restart a syscall that has been interrupted by a signal. */
       /* 1640 */ ULong guest_IP_AT_SYSCALL;
 
@@ -282,6 +282,12 @@ typedef
       /* 1656 */ ULong guest_TFHAR;     // Transaction Failure Handler Address Register 
       /* 1664 */ ULong guest_TEXASR;    // Transaction EXception And Summary Register
       /* 1672 */ ULong guest_TFIAR;     // Transaction Failure Instruction Address Register
+      /* 1680 */ UInt  guest_TEXASRU;   // Transaction EXception And Summary Register Upper
+
+      /* Padding to make it have an 16-aligned size */
+      /* 1684 */  UInt  padding1;
+      /* 1688 */  UInt  padding2;
+      /* 1692 */  UInt  padding3;
 
    }
    VexGuestPPC64State;

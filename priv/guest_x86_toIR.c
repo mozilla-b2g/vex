@@ -54,10 +54,6 @@
      for float-to-float rounding.  For all other operations, 
      round-to-nearest is used, regardless.
 
-   * FP sin/cos/tan/sincos: C2 flag is always cleared.  IOW the
-     simulation claims the argument is in-range (-2^63 <= arg <= 2^63)
-     even when it isn't.
-
    * some of the FCOM cases could do with testing -- not convinced
      that the args are the right way round.
 
@@ -199,11 +195,11 @@
    given insn. */
 
 /* We need to know this to do sub-register accesses correctly. */
-static Bool host_is_bigendian;
+static VexEndness host_endness;
 
 /* Pointer to the guest code area (points to start of BB, not to the
    insn being processed). */
-static UChar* guest_code;
+static const UChar* guest_code;
 
 /* The guest address corresponding to guest_code[0]. */
 static Addr32 guest_EIP_bbstart;
@@ -279,8 +275,8 @@ static IRSB* irsb;
 
 #define OFFB_EMNOTE    offsetof(VexGuestX86State,guest_EMNOTE)
 
-#define OFFB_TISTART   offsetof(VexGuestX86State,guest_TISTART)
-#define OFFB_TILEN     offsetof(VexGuestX86State,guest_TILEN)
+#define OFFB_CMSTART   offsetof(VexGuestX86State,guest_CMSTART)
+#define OFFB_CMLEN     offsetof(VexGuestX86State,guest_CMLEN)
 #define OFFB_NRADDR    offsetof(VexGuestX86State,guest_NRADDR)
 
 #define OFFB_IP_AT_SYSCALL offsetof(VexGuestX86State,guest_IP_AT_SYSCALL)
@@ -330,12 +326,12 @@ static IRTemp newTemp ( IRType ty )
 
 static UInt extend_s_8to32( UInt x )
 {
-   return (UInt)((((Int)x) << 24) >> 24);
+   return (UInt)((Int)(x << 24) >> 24);
 }
 
 static UInt extend_s_16to32 ( UInt x )
 {
-   return (UInt)((((Int)x) << 16) >> 16);
+  return (UInt)((Int)(x << 16) >> 16);
 }
 
 /* Fetch a byte from the guest insn stream. */
@@ -409,7 +405,7 @@ static UInt getSDisp8 ( Int delta )
 
 static UInt getSDisp16 ( Int delta0 )
 {
-   UChar* eip = (UChar*)(&guest_code[delta0]);
+   const UChar* eip = &guest_code[delta0];
    UInt d = *eip++;
    d |= ((*eip++) << 8);
    return extend_s_16to32(d);
@@ -456,7 +452,7 @@ static Int integerGuestRegOffset ( Int sz, UInt archreg )
    vassert(archreg < 8);
 
    /* Correct for little-endian host only. */
-   vassert(!host_is_bigendian);
+   vassert(host_endness == VexEndnessLE);
 
    if (sz == 4 || sz == 2 || (sz == 1 && archreg < 4)) {
       switch (archreg) {
@@ -519,7 +515,7 @@ static Int xmmGuestRegOffset ( UInt xmmreg )
 static Int xmmGuestRegLane16offset ( UInt xmmreg, Int laneno )
 {
    /* Correct for little-endian host only. */
-   vassert(!host_is_bigendian);
+   vassert(host_endness == VexEndnessLE);
    vassert(laneno >= 0 && laneno < 8);
    return xmmGuestRegOffset( xmmreg ) + 2 * laneno;
 }
@@ -527,7 +523,7 @@ static Int xmmGuestRegLane16offset ( UInt xmmreg, Int laneno )
 static Int xmmGuestRegLane32offset ( UInt xmmreg, Int laneno )
 {
    /* Correct for little-endian host only. */
-   vassert(!host_is_bigendian);
+   vassert(host_endness == VexEndnessLE);
    vassert(laneno >= 0 && laneno < 4);
    return xmmGuestRegOffset( xmmreg ) + 4 * laneno;
 }
@@ -535,7 +531,7 @@ static Int xmmGuestRegLane32offset ( UInt xmmreg, Int laneno )
 static Int xmmGuestRegLane64offset ( UInt xmmreg, Int laneno )
 {
    /* Correct for little-endian host only. */
-   vassert(!host_is_bigendian);
+   vassert(host_endness == VexEndnessLE);
    vassert(laneno >= 0 && laneno < 2);
    return xmmGuestRegOffset( xmmreg ) + 8 * laneno;
 }
@@ -3603,11 +3599,55 @@ static IRExpr* get_ST ( Int i )
 }
 
 
+/* Given i, and some expression e, and a condition cond, generate IR
+   which has the same effect as put_ST(i,e) when cond is true and has
+   no effect when cond is false.  Given the lack of proper
+   if-then-else in the IR, this is pretty tricky.
+*/
+
+static void maybe_put_ST ( IRTemp cond, Int i, IRExpr* value )
+{
+   // new_tag = if cond then FULL else old_tag
+   // new_val = if cond then (if old_tag==FULL then NaN else val)
+   //                   else old_val
+
+   IRTemp old_tag = newTemp(Ity_I8);
+   assign(old_tag, get_ST_TAG(i));
+   IRTemp new_tag = newTemp(Ity_I8);
+   assign(new_tag,
+          IRExpr_ITE(mkexpr(cond), mkU8(1)/*FULL*/, mkexpr(old_tag)));
+
+   IRTemp old_val = newTemp(Ity_F64);
+   assign(old_val, get_ST_UNCHECKED(i));
+   IRTemp new_val = newTemp(Ity_F64);
+   assign(new_val,
+          IRExpr_ITE(mkexpr(cond),
+                     IRExpr_ITE(binop(Iop_CmpNE8, mkexpr(old_tag), mkU8(0)),
+                                /* non-0 means full */
+                                mkQNaN64(),
+                                /* 0 means empty */
+                                value),
+                     mkexpr(old_val)));
+
+   put_ST_UNCHECKED(i, mkexpr(new_val));
+   // put_ST_UNCHECKED incorrectly sets tag(i) to always be FULL.  So 
+   // now set it to new_tag instead.
+   put_ST_TAG(i, mkexpr(new_tag));
+}
+
 /* Adjust FTOP downwards by one register. */
 
 static void fp_push ( void )
 {
    put_ftop( binop(Iop_Sub32, get_ftop(), mkU32(1)) );
+}
+
+/* Adjust FTOP downwards by one register when COND is 1:I1.  Else
+   don't change it. */
+
+static void maybe_fp_push ( IRTemp cond )
+{
+   put_ftop( binop(Iop_Sub32, get_ftop(), unop(Iop_1Uto32,mkexpr(cond))) );
 }
 
 /* Adjust FTOP upwards by one register, and mark the vacated register
@@ -3619,12 +3659,49 @@ static void fp_pop ( void )
    put_ftop( binop(Iop_Add32, get_ftop(), mkU32(1)) );
 }
 
-/* Clear the C2 bit of the FPU status register, for
-   sin/cos/tan/sincos. */
-
-static void clear_C2 ( void )
+/* Set the C2 bit of the FPU status register to e[0].  Assumes that
+   e[31:1] == 0. 
+*/
+static void set_C2 ( IRExpr* e )
 {
-   put_C3210( binop(Iop_And32, get_C3210(), mkU32(~X86G_FC_MASK_C2)) );
+   IRExpr* cleared = binop(Iop_And32, get_C3210(), mkU32(~X86G_FC_MASK_C2));
+   put_C3210( binop(Iop_Or32,
+                    cleared,
+                    binop(Iop_Shl32, e, mkU8(X86G_FC_SHIFT_C2))) );
+}
+
+/* Generate code to check that abs(d64) < 2^63 and is finite.  This is
+   used to do the range checks for FSIN, FCOS, FSINCOS and FPTAN.  The
+   test is simple, but the derivation of it is not so simple.
+
+   The exponent field for an IEEE754 double is 11 bits.  That means it
+   can take values 0 through 0x7FF.  If the exponent has value 0x7FF,
+   the number is either a NaN or an Infinity and so is not finite.
+   Furthermore, a finite value of exactly 2^63 is the smallest value
+   that has exponent value 0x43E.  Hence, what we need to do is
+   extract the exponent, ignoring the sign bit and mantissa, and check
+   it is < 0x43E, or <= 0x43D.
+
+   To make this easily applicable to 32- and 64-bit targets, a
+   roundabout approach is used.  First the number is converted to I64,
+   then the top 32 bits are taken.  Shifting them right by 20 bits
+   places the sign bit and exponent in the bottom 12 bits.  Anding
+   with 0x7FF gets rid of the sign bit, leaving just the exponent
+   available for comparison.
+*/
+static IRTemp math_IS_TRIG_ARG_FINITE_AND_IN_RANGE ( IRTemp d64 )
+{
+   IRTemp i64 = newTemp(Ity_I64);
+   assign(i64, unop(Iop_ReinterpF64asI64, mkexpr(d64)) );
+   IRTemp exponent = newTemp(Ity_I32);
+   assign(exponent,
+          binop(Iop_And32,
+                binop(Iop_Shr32, unop(Iop_64HIto32, mkexpr(i64)), mkU8(20)),
+                mkU32(0x7FF)));
+   IRTemp in_range_and_finite = newTemp(Ity_I1);
+   assign(in_range_and_finite,
+          binop(Iop_CmpLE32U, mkexpr(exponent), mkU32(0x43D)));
+   return in_range_and_finite;
 }
 
 /* Invent a plausible-looking FPU status word value:
@@ -4245,16 +4322,31 @@ UInt dis_FPU ( Bool* decode_ok, UChar sorb, Int delta )
                fp_pop();
                break;
 
-            case 0xF2: /* FPTAN */
-               DIP("ftan\n");
-               put_ST_UNCHECKED(0, 
-                  binop(Iop_TanF64, 
-                        get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
-                        get_ST(0)));
-               fp_push();
-               put_ST(0, IRExpr_Const(IRConst_F64(1.0)));
-               clear_C2(); /* HACK */
+            case 0xF2: { /* FPTAN */
+               DIP("fptan\n");
+               IRTemp argD = newTemp(Ity_F64);
+               assign(argD, get_ST(0));
+               IRTemp argOK = math_IS_TRIG_ARG_FINITE_AND_IN_RANGE(argD);
+               IRTemp resD = newTemp(Ity_F64);
+               assign(resD,
+                  IRExpr_ITE(
+                     mkexpr(argOK), 
+                     binop(Iop_TanF64,
+                           get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
+                           mkexpr(argD)),
+                     mkexpr(argD))
+               );
+               put_ST_UNCHECKED(0, mkexpr(resD));
+               /* Conditionally push 1.0 on the stack, if the arg is
+                  in range */
+               maybe_fp_push(argOK);
+               maybe_put_ST(argOK, 0,
+                            IRExpr_Const(IRConst_F64(1.0)));
+               set_C2( binop(Iop_Xor32,
+                             unop(Iop_1Uto32, mkexpr(argOK)), 
+                             mkU32(1)) );
                break;
+            }
 
             case 0xF3: /* FPATAN */
                DIP("fpatan\n");
@@ -4368,19 +4460,30 @@ UInt dis_FPU ( Bool* decode_ok, UChar sorb, Int delta )
                break;
 
             case 0xFB: { /* FSINCOS */
-               IRTemp a1 = newTemp(Ity_F64);
-               assign( a1, get_ST(0) );
                DIP("fsincos\n");
-               put_ST_UNCHECKED(0, 
-                  binop(Iop_SinF64, 
-                        get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
-                        mkexpr(a1)));
-               fp_push();
-               put_ST(0, 
+               IRTemp argD = newTemp(Ity_F64);
+               assign(argD, get_ST(0));
+               IRTemp argOK = math_IS_TRIG_ARG_FINITE_AND_IN_RANGE(argD);
+               IRTemp resD = newTemp(Ity_F64);
+               assign(resD,
+                  IRExpr_ITE(
+                     mkexpr(argOK), 
+                     binop(Iop_SinF64,
+                           get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
+                           mkexpr(argD)),
+                     mkexpr(argD))
+               );
+               put_ST_UNCHECKED(0, mkexpr(resD));
+               /* Conditionally push the cos value on the stack, if
+                  the arg is in range */
+               maybe_fp_push(argOK);
+               maybe_put_ST(argOK, 0,
                   binop(Iop_CosF64,
                         get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
-                        mkexpr(a1)));
-               clear_C2(); /* HACK */
+                        mkexpr(argD)));
+               set_C2( binop(Iop_Xor32,
+                             unop(Iop_1Uto32, mkexpr(argOK)), 
+                             mkU32(1)) );
                break;
             }
 
@@ -4399,23 +4502,28 @@ UInt dis_FPU ( Bool* decode_ok, UChar sorb, Int delta )
                         get_ST(1)));
                break;
 
-            case 0xFE: /* FSIN */
-               DIP("fsin\n");
-               put_ST_UNCHECKED(0, 
-                  binop(Iop_SinF64, 
-                        get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
-                        get_ST(0)));
-               clear_C2(); /* HACK */
+            case 0xFE:   /* FSIN */
+            case 0xFF: { /* FCOS */
+               Bool isSIN = modrm == 0xFE;
+               DIP("%s\n", isSIN ? "fsin" : "fcos");
+               IRTemp argD = newTemp(Ity_F64);
+               assign(argD, get_ST(0));
+               IRTemp argOK = math_IS_TRIG_ARG_FINITE_AND_IN_RANGE(argD);
+               IRTemp resD = newTemp(Ity_F64);
+               assign(resD,
+                  IRExpr_ITE(
+                     mkexpr(argOK), 
+                     binop(isSIN ? Iop_SinF64 : Iop_CosF64,
+                           get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
+                           mkexpr(argD)),
+                     mkexpr(argD))
+               );
+               put_ST_UNCHECKED(0, mkexpr(resD));
+               set_C2( binop(Iop_Xor32,
+                             unop(Iop_1Uto32, mkexpr(argOK)), 
+                             mkU32(1)) );
                break;
-
-            case 0xFF: /* FCOS */
-               DIP("fcos\n");
-               put_ST_UNCHECKED(0, 
-                  binop(Iop_CosF64, 
-                        get_FAKE_roundingmode(), /* XXXROUNDINGFIXME */
-                        get_ST(0)));
-               clear_C2(); /* HACK */
-               break;
+            }
 
             default:
                goto decode_fail;
@@ -6202,7 +6310,7 @@ static const HChar* nameBtOp ( BtOp op )
 
 
 static
-UInt dis_bt_G_E ( VexAbiInfo* vbi,
+UInt dis_bt_G_E ( const VexAbiInfo* vbi,
                   UChar sorb, Bool locked, Int sz, Int delta, BtOp op )
 {
    HChar  dis_buf[50];
@@ -7026,17 +7134,26 @@ static UInt dis_SSE_E_to_G_unary_all (
    Int     alen;
    IRTemp  addr;
    UChar   rm = getIByte(delta);
+   // Sqrt32Fx4 and Sqrt64Fx2 take a rounding mode, which is faked
+   // up in the usual way.
+   Bool needsIRRM = op == Iop_Sqrt32Fx4 || op == Iop_Sqrt64Fx2;
    if (epartIsReg(rm)) {
-      putXMMReg( gregOfRM(rm), 
-                 unop(op, getXMMReg(eregOfRM(rm))) );
+      IRExpr* src = getXMMReg(eregOfRM(rm));
+      /* XXXROUNDINGFIXME */
+      IRExpr* res = needsIRRM ? binop(op, get_FAKE_roundingmode(), src)
+                              : unop(op, src);
+      putXMMReg( gregOfRM(rm), res );
       DIP("%s %s,%s\n", opname,
                         nameXMMReg(eregOfRM(rm)),
                         nameXMMReg(gregOfRM(rm)) );
       return delta+1;
    } else {
       addr = disAMode ( &alen, sorb, delta, dis_buf );
-      putXMMReg( gregOfRM(rm), 
-                 unop(op, loadLE(Ity_V128, mkexpr(addr))) );
+      IRExpr* src = loadLE(Ity_V128, mkexpr(addr));
+      /* XXXROUNDINGFIXME */
+      IRExpr* res = needsIRRM ? binop(op, get_FAKE_roundingmode(), src)
+                              : unop(op, src);
+      putXMMReg( gregOfRM(rm), res );
       DIP("%s %s,%s\n", opname,
                         dis_buf,
                         nameXMMReg(gregOfRM(rm)) );
@@ -7832,7 +7949,7 @@ static void gen_SEGV_if_not_16_aligned ( IRTemp effective_addr )
 
    Same for BTS, BTR
 */
-static Bool can_be_used_with_LOCK_prefix ( UChar* opc )
+static Bool can_be_used_with_LOCK_prefix ( const UChar* opc )
 {
    switch (opc[0]) {
       case 0x00: case 0x01: case 0x08: case 0x09:
@@ -7953,12 +8070,12 @@ static IRTemp math_BSWAP ( IRTemp t1, IRType ty )
 static
 DisResult disInstr_X86_WRK (
              /*OUT*/Bool* expect_CAS,
-             Bool         (*resteerOkFn) ( /*opaque*/void*, Addr64 ),
+             Bool         (*resteerOkFn) ( /*opaque*/void*, Addr ),
              Bool         resteerCisOk,
              void*        callback_opaque,
              Long         delta64,
-             VexArchInfo* archinfo,
-             VexAbiInfo*  vbi,
+             const VexArchInfo* archinfo,
+             const VexAbiInfo*  vbi,
              Bool         sigill_diag
           )
 {
@@ -7970,7 +8087,7 @@ DisResult disInstr_X86_WRK (
    HChar     dis_buf[50];
    Int       am_sz, d_sz, n_prefixes;
    DisResult dres;
-   UChar*    insn; /* used in SSE decoders */
+   const UChar* insn; /* used in SSE decoders */
 
    /* The running delta */
    Int delta = (Int)delta64;
@@ -8006,7 +8123,7 @@ DisResult disInstr_X86_WRK (
 
    /* Spot "Special" instructions (see comment at top of file). */
    {
-      UChar* code = (UChar*)(guest_code + delta);
+      const UChar* code = guest_code + delta;
       /* Spot the 12-byte preamble:
          C1C703   roll $3,  %edi
          C1C70D   roll $13, %edi
@@ -8059,14 +8176,14 @@ DisResult disInstr_X86_WRK (
             // injecting here can change. In which case the translation has to
             // be redone. For ease of handling, we simply invalidate all the
             // time.
-            stmt(IRStmt_Put(OFFB_TISTART, mkU32(guest_EIP_curr_instr)));
-            stmt(IRStmt_Put(OFFB_TILEN,   mkU32(14)));
+            stmt(IRStmt_Put(OFFB_CMSTART, mkU32(guest_EIP_curr_instr)));
+            stmt(IRStmt_Put(OFFB_CMLEN,   mkU32(14)));
    
             delta += 14;
 
             stmt( IRStmt_Put( OFFB_EIP, mkU32(guest_EIP_bbstart + delta) ) );
             dres.whatNext    = Dis_StopHere;
-            dres.jk_StopHere = Ijk_TInval;
+            dres.jk_StopHere = Ijk_InvalICache;
             goto decode_success;
          }
          /* We don't know what it is. */
@@ -8078,7 +8195,7 @@ DisResult disInstr_X86_WRK (
    /* Handle a couple of weird-ass NOPs that have been observed in the
       wild. */
    {
-      UChar* code = (UChar*)(guest_code + delta);
+      const UChar* code = guest_code + delta;
       /* Sun's JVM 1.5.0 uses the following as a NOP:
          26 2E 64 65 90  %es:%cs:%fs:%gs:nop */
       if (code[0] == 0x26 && code[1] == 0x2E && code[2] == 0x64 
@@ -8174,7 +8291,7 @@ DisResult disInstr_X86_WRK (
       allowed. */
 
    if (pfx_lock) {
-      if (can_be_used_with_LOCK_prefix( (UChar*)&guest_code[delta] )) {
+     if (can_be_used_with_LOCK_prefix( &guest_code[delta] )) {
          DIP("lock ");
       } else {
          *expect_CAS = False;
@@ -8193,7 +8310,7 @@ DisResult disInstr_X86_WRK (
    /* Note, this doesn't handle SSE2 or SSE3.  That is handled in a
       later section, further on. */
 
-   insn = (UChar*)&guest_code[delta];
+   insn = &guest_code[delta];
 
    /* Treat fxsave specially.  It should be doable even on an SSE0
       (Pentium-II class) CPU.  Hence be prepared to handle it on
@@ -9243,7 +9360,7 @@ DisResult disInstr_X86_WRK (
    if (insn[0] == 0x0F && insn[1] == 0x53) {
       vassert(sz == 4);
       delta = dis_SSE_E_to_G_unary_all( sorb, delta+2, 
-                                        "rcpps", Iop_Recip32Fx4 );
+                                        "rcpps", Iop_RecipEst32Fx4 );
       goto decode_success;
    }
 
@@ -9251,7 +9368,7 @@ DisResult disInstr_X86_WRK (
    if (insn[0] == 0xF3 && insn[1] == 0x0F && insn[2] == 0x53) {
       vassert(sz == 4);
       delta = dis_SSE_E_to_G_unary_lo32( sorb, delta+3, 
-                                         "rcpss", Iop_Recip32F0x4 );
+                                         "rcpss", Iop_RecipEst32F0x4 );
       goto decode_success;
    }
 
@@ -9259,7 +9376,7 @@ DisResult disInstr_X86_WRK (
    if (insn[0] == 0x0F && insn[1] == 0x52) {
       vassert(sz == 4);
       delta = dis_SSE_E_to_G_unary_all( sorb, delta+2, 
-                                        "rsqrtps", Iop_RSqrt32Fx4 );
+                                        "rsqrtps", Iop_RSqrtEst32Fx4 );
       goto decode_success;
    }
 
@@ -9267,7 +9384,7 @@ DisResult disInstr_X86_WRK (
    if (insn[0] == 0xF3 && insn[1] == 0x0F && insn[2] == 0x52) {
       vassert(sz == 4);
       delta = dis_SSE_E_to_G_unary_lo32( sorb, delta+3, 
-                                         "rsqrtss", Iop_RSqrt32F0x4 );
+                                         "rsqrtss", Iop_RSqrtEst32F0x4 );
       goto decode_success;
    }
 
@@ -9429,7 +9546,7 @@ DisResult disInstr_X86_WRK (
    if (0 == (archinfo->hwcaps & VEX_HWCAPS_X86_SSE2))
       goto after_sse_decoders; /* no SSE2 capabilities */
 
-   insn = (UChar*)&guest_code[delta];
+   insn = &guest_code[delta];
 
    /* 66 0F 58 = ADDPD -- add 32Fx4 from R/M to R */
    if (sz == 2 && insn[0] == 0x0F && insn[1] == 0x58) {
@@ -11646,14 +11763,14 @@ DisResult disInstr_X86_WRK (
 
       /* Round addr down to the start of the containing block. */
       stmt( IRStmt_Put(
-               OFFB_TISTART,
+               OFFB_CMSTART,
                binop( Iop_And32, 
                       mkexpr(addr), 
                       mkU32( ~(lineszB-1) ))) );
 
-      stmt( IRStmt_Put(OFFB_TILEN, mkU32(lineszB) ) );
+      stmt( IRStmt_Put(OFFB_CMLEN, mkU32(lineszB) ) );
 
-      jmp_lit(&dres, Ijk_TInval, (Addr32)(guest_EIP_bbstart+delta));
+      jmp_lit(&dres, Ijk_InvalICache, (Addr32)(guest_EIP_bbstart+delta));
 
       DIP("clflush %s\n", dis_buf);
       goto decode_success;
@@ -11669,14 +11786,10 @@ DisResult disInstr_X86_WRK (
 
    /* Skip parts of the decoder which don't apply given the stated
       guest subarchitecture. */
-   /* if (0 == (archinfo->hwcaps & VEX_HWCAPS_X86_SSE3)) */
-   /* In fact this is highly bogus; we accept SSE3 insns even on a
-      SSE2-only guest since they turn into IR which can be re-emitted
-      successfully on an SSE2 host. */
-   if (0 == (archinfo->hwcaps & VEX_HWCAPS_X86_SSE2))
+   if (0 == (archinfo->hwcaps & VEX_HWCAPS_X86_SSE3))
       goto after_sse_decoders; /* no SSE3 capabilities */
 
-   insn = (UChar*)&guest_code[delta];
+   insn = &guest_code[delta];
 
    /* F3 0F 12 = MOVSLDUP -- move from E (mem or xmm) to G (xmm),
       duplicating some lanes (2:2:0:0). */
@@ -12974,10 +13087,10 @@ DisResult disInstr_X86_WRK (
          assign(t1, binop(Iop_Sub32, getIReg(4,R_ESP), mkU32(4)));
          putIReg(4, R_ESP, mkexpr(t1));
          storeLE( mkexpr(t1), mkU32(guest_EIP_bbstart+delta));
-         if (resteerOkFn( callback_opaque, (Addr64)(Addr32)d32 )) {
+         if (resteerOkFn( callback_opaque, (Addr32)d32 )) {
             /* follow into the call target. */
             dres.whatNext   = Dis_ResteerU;
-            dres.continueAt = (Addr64)(Addr32)d32;
+            dres.continueAt = (Addr32)d32;
          } else {
             jmp_lit(&dres, Ijk_Call, d32);
             vassert(dres.whatNext == Dis_StopHere);
@@ -13289,9 +13402,9 @@ DisResult disInstr_X86_WRK (
    case 0xEB: /* Jb (jump, byte offset) */
       d32 = (((Addr32)guest_EIP_bbstart)+delta+1) + getSDisp8(delta); 
       delta++;
-      if (resteerOkFn( callback_opaque, (Addr64)(Addr32)d32) ) {
+      if (resteerOkFn( callback_opaque, (Addr32)d32) ) {
          dres.whatNext   = Dis_ResteerU;
-         dres.continueAt = (Addr64)(Addr32)d32;
+         dres.continueAt = (Addr32)d32;
       } else {
          jmp_lit(&dres, Ijk_Boring, d32);
          vassert(dres.whatNext == Dis_StopHere);
@@ -13303,9 +13416,9 @@ DisResult disInstr_X86_WRK (
       vassert(sz == 4); /* JRS added 2004 July 11 */
       d32 = (((Addr32)guest_EIP_bbstart)+delta+sz) + getSDisp(sz,delta); 
       delta += sz;
-      if (resteerOkFn( callback_opaque, (Addr64)(Addr32)d32) ) {
+      if (resteerOkFn( callback_opaque, (Addr32)d32) ) {
          dres.whatNext   = Dis_ResteerU;
-         dres.continueAt = (Addr64)(Addr32)d32;
+         dres.continueAt = (Addr32)d32;
       } else {
          jmp_lit(&dres, Ijk_Boring, d32);
          vassert(dres.whatNext == Dis_StopHere);
@@ -13339,7 +13452,7 @@ DisResult disInstr_X86_WRK (
           && vex_control.guest_chase_cond
           && (Addr32)d32 != (Addr32)guest_EIP_bbstart
           && jmpDelta < 0
-          && resteerOkFn( callback_opaque, (Addr64)(Addr32)d32) ) {
+          && resteerOkFn( callback_opaque, (Addr32)d32) ) {
          /* Speculation: assume this backward branch is taken.  So we
             need to emit a side-exit to the insn following this one,
             on the negation of the condition, and continue at the
@@ -13352,7 +13465,7 @@ DisResult disInstr_X86_WRK (
                   IRConst_U32(guest_EIP_bbstart+delta),
                   OFFB_EIP ) );
          dres.whatNext   = Dis_ResteerC;
-         dres.continueAt = (Addr64)(Addr32)d32;
+         dres.continueAt = (Addr32)d32;
          comment = "(assumed taken)";
       }
       else
@@ -13361,7 +13474,7 @@ DisResult disInstr_X86_WRK (
           && (Addr32)d32 != (Addr32)guest_EIP_bbstart
           && jmpDelta >= 0
           && resteerOkFn( callback_opaque, 
-                          (Addr64)(Addr32)(guest_EIP_bbstart+delta)) ) {
+                          (Addr32)(guest_EIP_bbstart+delta)) ) {
          /* Speculation: assume this forward branch is not taken.  So
             we need to emit a side-exit to d32 (the dest) and continue
             disassembling at the insn immediately following this
@@ -13372,7 +13485,7 @@ DisResult disInstr_X86_WRK (
                   IRConst_U32(d32),
                   OFFB_EIP ) );
          dres.whatNext   = Dis_ResteerC;
-         dres.continueAt = (Addr64)(Addr32)(guest_EIP_bbstart+delta);
+         dres.continueAt = guest_EIP_bbstart + delta;
          comment = "(assumed not taken)";
       }
       else {
@@ -14903,7 +15016,7 @@ DisResult disInstr_X86_WRK (
              && vex_control.guest_chase_cond
              && (Addr32)d32 != (Addr32)guest_EIP_bbstart
              && jmpDelta < 0
-             && resteerOkFn( callback_opaque, (Addr64)(Addr32)d32) ) {
+             && resteerOkFn( callback_opaque, (Addr32)d32) ) {
             /* Speculation: assume this backward branch is taken.  So
                we need to emit a side-exit to the insn following this
                one, on the negation of the condition, and continue at
@@ -14917,7 +15030,7 @@ DisResult disInstr_X86_WRK (
                      IRConst_U32(guest_EIP_bbstart+delta),
                      OFFB_EIP ) );
             dres.whatNext   = Dis_ResteerC;
-            dres.continueAt = (Addr64)(Addr32)d32;
+            dres.continueAt = (Addr32)d32;
             comment = "(assumed taken)";
          }
          else
@@ -14926,7 +15039,7 @@ DisResult disInstr_X86_WRK (
              && (Addr32)d32 != (Addr32)guest_EIP_bbstart
              && jmpDelta >= 0
              && resteerOkFn( callback_opaque, 
-                             (Addr64)(Addr32)(guest_EIP_bbstart+delta)) ) {
+                             (Addr32)(guest_EIP_bbstart+delta)) ) {
             /* Speculation: assume this forward branch is not taken.
                So we need to emit a side-exit to d32 (the dest) and
                continue disassembling at the insn immediately
@@ -14937,7 +15050,7 @@ DisResult disInstr_X86_WRK (
                      IRConst_U32(d32),
                      OFFB_EIP ) );
             dres.whatNext   = Dis_ResteerC;
-            dres.continueAt = (Addr64)(Addr32)(guest_EIP_bbstart+delta);
+            dres.continueAt = guest_EIP_bbstart + delta;
             comment = "(assumed not taken)";
          }
          else {
@@ -15304,16 +15417,16 @@ DisResult disInstr_X86_WRK (
    is located in host memory at &guest_code[delta]. */
 
 DisResult disInstr_X86 ( IRSB*        irsb_IN,
-                         Bool         (*resteerOkFn) ( void*, Addr64 ),
+                         Bool         (*resteerOkFn) ( void*, Addr ),
                          Bool         resteerCisOk,
                          void*        callback_opaque,
-                         UChar*       guest_code_IN,
+                         const UChar* guest_code_IN,
                          Long         delta,
-                         Addr64       guest_IP,
+                         Addr         guest_IP,
                          VexArch      guest_arch,
-                         VexArchInfo* archinfo,
-                         VexAbiInfo*  abiinfo,
-                         Bool         host_bigendian_IN,
+                         const VexArchInfo* archinfo,
+                         const VexAbiInfo*  abiinfo,
+                         VexEndness   host_endness_IN,
                          Bool         sigill_diag_IN )
 {
    Int       i, x1, x2;
@@ -15324,7 +15437,7 @@ DisResult disInstr_X86 ( IRSB*        irsb_IN,
    vassert(guest_arch == VexArchX86);
    guest_code           = guest_code_IN;
    irsb                 = irsb_IN;
-   host_is_bigendian    = host_bigendian_IN;
+   host_endness         = host_endness_IN;
    guest_EIP_curr_instr = (Addr32)guest_IP;
    guest_EIP_bbstart    = (Addr32)toUInt(guest_IP - delta);
 
